@@ -1,0 +1,52 @@
+import numpy as np
+from scipy.ndimage import convolve
+from sklearn.metrics import mean_squared_error
+
+def myPan6(sol, userdata):
+    """
+    MATLAB myPan6 fonksiyonunun Python çevirisi
+    
+    Parameters:
+    sol: numpy array - çözüm matrisi
+    userdata: dict - 'pan' ve 'msi' anahtarlarını içeren sözlük
+    
+    Returns:
+    out: numpy array - çıktı değerleri
+    ps: numpy array - işlenmiş msi verisi
+    """
+    
+    pan = np.array(userdata['pan'], dtype=np.float64)
+    msi = np.array(userdata['msi'], dtype=np.float64)
+    
+    n = sol.shape[0]
+    out = np.full(n, np.inf)
+    ps = msi.copy()  # memory
+    
+    for i in range(n):
+        # İlk 9 elemanı al ve 3x3 matrise dönüştür
+        k = sol[i, 0:9]
+        k = k.reshape(3, 3)
+        k = k / np.sum(k)
+        
+        # MATLAB'ın imfilter fonksiyonunu scipy.ndimage.convolve ile simüle et
+        # 'replicate' modu için mode='nearest' kullanılır
+        low = convolve(pan, k, mode='nearest')
+        hi = pan - low
+        
+        # Ağırlıkları al
+        w = sol[i, 9:]
+        
+        # Her kanal için işlem yap
+        for j in range(3):
+            ps[:, :, j] = pan + w[j] * (msi[:, :, j] - pan) + w[j + 3] * hi
+        
+        # RMSE hesapla
+        rmse_msi_ps = np.sqrt(mean_squared_error(msi.flatten(), ps.flatten()))
+        
+        # Pan'ı 3 kanala çoğalt
+        pan_3d = np.stack([pan, pan, pan], axis=2)
+        rmse_pan_ps = np.sqrt(mean_squared_error(pan_3d.flatten(), ps.flatten()))
+        
+        out[i] = (rmse_msi_ps + rmse_pan_ps) / 2
+    
+    return out, ps
