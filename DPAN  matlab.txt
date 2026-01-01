@@ -1,23 +1,365 @@
-% DPAN
+function [out, ps, qnr, w, kmat, wmat, L] = dpan(sol, userdata)
 
-function [out, ps] = myPan6(sol, userdata)
 pan = double(userdata.pan);
+[M,N]=size(pan);
 msi = double(userdata.msi);
+msi4=[]; for i=1:3, msi4(:,:,i)=imresize(msi(:,:,i),ceil(0.25*[M N]));end
+pan3d=cat(3,pan,pan,pan);
 n=size(sol,1);
 out=inf(n,1);
-ps=msi; %memory
+ps=msi; % memory
+kmat=[]; % memory
+wmat=[]; % memory
 for i=1:n
     k=sol(i,1:9);
     k=reshape(k,3,3);
-    k=k./sum(k(:));    
-    low=imfilter(pan,k,"replicate");
-    hi=pan-low;
-
+    k=k./sum(k(:));
+    L=imfilter(pan,k,"replicate");
     w=sol(i,10:end);
+    for j=1:3, w(j)=w(j)/(w(j)+w(j+3)); w(j+3)=w(j+3)/(w(j)+w(j+3));end
     for j=1:3
-        ps(:,:,j) = pan + w(j)*(msi(:,:,j)-pan) + w(j+3)*hi;
+        ps(:,:,j) = pan + w(j)*(msi(:,:,j)-pan) + w(j+3)*(msi(:,:,j)-L);
     end
+    qnr=my_QNR_improved(msi4, pan, ps);
+    out(i)=( immse( uint8(msi) , uint8(ps) ) + immse( uint8(pan3d) , uint8(ps) ) ) / (2);
+    out(i)= out(i)/ compute_QNR(msi4, pan, ps);
 
-    out(i)=( rmse(msi,ps) + rmse( cat(3,pan,pan,pan),ps) )/ 2;
 
+    % out(i)=- qnr;
+
+    kmat=k;
+    wmat=w;
+end
+
+
+
+
+
+
+function [QNR, D_lambda, D_s] = compute_QNR(MS, PAN, PS, ratio, p, q, alpha, beta, blockSize)
+% QNR - Quality with No Reference index for pansharpened images
+%
+% This implementation follows Alparone et al. (2008) "Multispectral and 
+% panchromatic data fusion assessment without reference"
+%
+% Syntax:
+%   [QNR, D_lambda, D_s] = my_QNR_improved(MS, PAN, PS)
+%   [QNR, D_lambda, D_s] = my_QNR_improved(MS, PAN, PS, ratio, p, q, alpha, beta, blockSize)
+%
+% Inputs:
+%   MS        - Original Low-Resolution Multispectral image (H/R x W/R x B)
+%               NOTE: This should be the ORIGINAL LR-MS, NOT upsampled
+%   PAN       - Panchromatic image at full resolution (H x W)
+%   PS        - Pansharpened image (H x W x B)
+%   ratio     - Spatial resolution ratio (default: 4)
+%   p         - Exponent for D_lambda averaging (default: 1)
+%   q         - Exponent for D_s averaging (default: 1)  
+%   alpha     - Exponent for D_lambda in QNR (default: 1)
+%   beta      - Exponent for D_s in QNR (default: 1)
+%   blockSize - Block size for UIQI calculation (default: 32)
+%
+% Outputs:
+%   QNR       - Quality with No Reference index [0,1], higher is better
+%   D_lambda  - Spectral distortion index [0,1], lower is better
+%   D_s       - Spatial distortion index [0,1], lower is better
+%
+% Key Theoretical Points:
+%   1. D_lambda measures spectral distortion by comparing inter-band UIQI 
+%      values between upsampled MS and pansharpened image
+%   2. D_s measures spatial distortion by comparing UIQI between:
+%      - Each PS band and PAN (at full resolution)
+%      - Each MS band and low-pass filtered PAN (at MS resolution)
+%   3. The low-pass filter for PAN should ideally match the MTF of the sensor
+%   4. QNR = (1 - D_lambda)^alpha * (1 - D_s)^beta
+%
+% References:
+%   [1] L. Alparone, B. Aiazzi, S. Baronti, A. Garzelli, F. Nencini, and 
+%       M. Selva, "Multispectral and panchromatic data fusion assessment 
+%       without reference," Photogramm. Eng. Remote Sens., vol. 74, no. 2, 
+%       pp. 193-200, Feb. 2008.
+%   [2] G. Vivone et al., "A Critical Comparison Among Pansharpening 
+%       Algorithms," IEEE Trans. Geosci. Remote Sens., 2015.
+
+    %% Default parameters (following standard conventions)
+    if nargin < 4 || isempty(ratio)
+        ratio = 4;  % Typical MS/PAN resolution ratio
+    end
+    if nargin < 5 || isempty(p)
+        p = 1;
+    end
+    if nargin < 6 || isempty(q)
+        q = 1;
+    end
+    if nargin < 7 || isempty(alpha)
+        alpha = 1;
+    end
+    if nargin < 8 || isempty(beta)
+        beta = 1;
+    end
+    if nargin < 9 || isempty(blockSize)
+        blockSize = 32;
+    end
+    
+    %% Convert to double for calculations
+    MS = double(MS);
+    PAN = double(PAN);
+    PS = double(PS);
+    
+    %% Get dimensions
+    [rowsPS, colsPS, numBands] = size(PS);
+    [rowsMS, colsMS, ~] = size(MS);
+    
+    %% Upsample MS to PS resolution if needed
+    % The original MS should be at low resolution
+    if rowsMS ~= rowsPS || colsMS ~= colsPS
+        MS_upsampled = zeros(rowsPS, colsPS, numBands);
+        for b = 1:numBands
+            MS_upsampled(:,:,b) = imresize(MS(:,:,b), [rowsPS, colsPS], 'bicubic');
+        end
+    else
+        % MS is already upsampled - use as is but warn
+        warning('MS appears to be already at PS resolution. For accurate QNR, provide original LR-MS.');
+        MS_upsampled = MS;
+    end
+    
+    %% Ensure PAN matches PS size
+    if size(PAN, 1) ~= rowsPS || size(PAN, 2) ~= colsPS
+        PAN = imresize(PAN, [rowsPS, colsPS], 'bicubic');
+    end
+    
+    %% Create low-pass filtered PAN
+    % This simulates the PAN at MS resolution
+    % Method: MTF-based Gaussian filter then decimate and interpolate back
+    % For accurate results, use sensor-specific MTF values
+    PAN_LP = MTFfilter(PAN, ratio);
+    
+    %% Calculate D_lambda (Spectral Distortion)
+    D_lambda = calculateDlambda(MS_upsampled, PS, p, blockSize);
+    
+    %% Calculate D_s (Spatial Distortion)
+    D_s = calculateDs(MS_upsampled, PAN, PAN_LP, PS, q, blockSize);
+    
+    %% Calculate QNR
+    % QNR = (1 - D_lambda)^alpha * (1 - D_s)^beta
+    QNR = ((1 - D_lambda)^alpha) * ((1 - D_s)^beta);
+    
+end
+
+%% MTF-based Low-Pass Filter
+function img_LP = MTFfilter(img, ratio)
+% Apply MTF-based low-pass filter to simulate lower resolution
+% Uses Gaussian approximation of typical sensor MTF
+%
+% For more accurate results, use sensor-specific MTF values:
+%   GeoEye-1: MTF ~ 0.3 at Nyquist
+%   WorldView-2: MTF ~ 0.35 at Nyquist  
+%   QuickBird: MTF ~ 0.34 at Nyquist
+%   IKONOS: MTF ~ 0.26 at Nyquist
+
+    % Default MTF value at Nyquist (typical value)
+    MTF_nyquist = 0.3;
+    
+    % Calculate Gaussian filter sigma from MTF at Nyquist
+    % MTF(f) = exp(-2*pi^2*sigma^2*f^2)
+    % At Nyquist: f = 0.5, so sigma = sqrt(-log(MTF)/(2*pi^2*0.25))
+    sigma = sqrt(-log(MTF_nyquist) / (2 * pi^2 * 0.25));
+    
+    % Scale sigma by ratio
+    sigma = sigma * ratio;
+    
+    % Create Gaussian filter
+    filterSize = ceil(sigma * 6);
+    if mod(filterSize, 2) == 0
+        filterSize = filterSize + 1;
+    end
+    h = fspecial('gaussian', filterSize, sigma);
+    
+    % Apply filter
+    img_filtered = imfilter(img, h, 'replicate');
+    
+    % Decimate and interpolate back
+    [rows, cols] = size(img);
+    img_small = imresize(img_filtered, 1/ratio, 'bicubic');
+    img_LP = imresize(img_small, [rows, cols], 'bicubic');
+    
+end
+
+%% D_lambda calculation (Spectral Distortion)
+function D_lambda = calculateDlambda(MS_up, PS, p, blockSize)
+% Calculate spectral distortion based on inter-band UIQI differences
+%
+% D_lambda measures how well the spectral relationships between bands
+% are preserved after pansharpening
+%
+% Formula: D_lambda = (1/(L*(L-1)) * sum_{i,j, i!=j} |Q(MS_i,MS_j) - Q(PS_i,PS_j)|^p)^(1/p)
+
+    numBands = size(MS_up, 3);
+    
+    if numBands == 1
+        D_lambda = 0;
+        return;
+    end
+    
+    % Calculate UIQI between all unique band pairs
+    sumVal = 0;
+    count = 0;
+    
+    for i = 1:numBands
+        for j = 1:numBands
+            if i ~= j
+                % UIQI between bands i and j in upsampled MS
+                Q_MS = UIQI(MS_up(:,:,i), MS_up(:,:,j), blockSize);
+                
+                % UIQI between bands i and j in PS
+                Q_PS = UIQI(PS(:,:,i), PS(:,:,j), blockSize);
+                
+                % Accumulate absolute difference raised to power p
+                sumVal = sumVal + abs(Q_MS - Q_PS)^p;
+                count = count + 1;
+            end
+        end
+    end
+    
+    % D_lambda formula: mean of |differences|^p, then take p-th root
+    if count > 0
+        D_lambda = (sumVal / count)^(1/p);
+    else
+        D_lambda = 0;
+    end
+    
+end
+
+%% D_s calculation (Spatial Distortion)
+function D_s = calculateDs(MS_up, PAN, PAN_LP, PS, q, blockSize)
+% Calculate spatial distortion based on UIQI with PAN
+%
+% D_s measures how well spatial details are transferred from PAN to PS
+%
+% Formula: D_s = (1/L * sum_k |Q(PS_k, PAN) - Q(MS_k, PAN_LP)|^q)^(1/q)
+%
+% The key insight is:
+%   - Q(PS_k, PAN) measures spatial similarity at full resolution
+%   - Q(MS_k, PAN_LP) measures spatial similarity at low resolution
+%   - These should be similar if spatial details are properly injected
+
+    numBands = size(PS, 3);
+    
+    sumVal = 0;
+    
+    for b = 1:numBands
+        % UIQI between pansharpened band and full-resolution PAN
+        Q_PS_PAN = UIQI(PS(:,:,b), PAN, blockSize);
+        
+        % UIQI between upsampled MS band and low-pass filtered PAN
+        Q_MS_PAN = UIQI(MS_up(:,:,b), PAN_LP, blockSize);
+        
+        % Accumulate absolute difference raised to power q
+        sumVal = sumVal + abs(Q_PS_PAN - Q_MS_PAN)^q;
+    end
+    
+    % D_s formula: mean of |differences|^q, then take q-th root
+    D_s = (sumVal / numBands)^(1/q);
+    
+end
+
+%% Universal Image Quality Index (UIQI)
+function Q = UIQI(img1, img2, blockSize)
+% Calculate Universal Image Quality Index (Wang & Bovik, 2002)
+%
+% UIQI = (4 * sigma_xy * mu_x * mu_y) / 
+%        ((sigma_x^2 + sigma_y^2) * (mu_x^2 + mu_y^2))
+%
+% This can be decomposed into three components:
+%   - Correlation: sigma_xy / (sigma_x * sigma_y)
+%   - Luminance: 2*mu_x*mu_y / (mu_x^2 + mu_y^2)  
+%   - Contrast: 2*sigma_x*sigma_y / (sigma_x^2 + sigma_y^2)
+%
+% Reference: Z. Wang and A.C. Bovik, "A Universal Image Quality Index,"
+%            IEEE Signal Processing Letters, vol. 9, no. 3, pp. 81-84, 2002.
+
+    if nargin < 3
+        blockSize = 8;  % Default as per original paper
+    end
+    
+    img1 = double(img1);
+    img2 = double(img2);
+    
+    [rows, cols] = size(img1);
+    
+    % Ensure block size doesn't exceed image size
+    blockSize = min([blockSize, rows, cols]);
+    
+    % Calculate number of complete blocks
+    numBlocksR = floor(rows / blockSize);
+    numBlocksC = floor(cols / blockSize);
+    
+    if numBlocksR == 0 || numBlocksC == 0
+        % Image too small for block-based, calculate global UIQI
+        Q = calculateBlockUIQI(img1(:), img2(:));
+        return;
+    end
+    
+    % Trim images to fit complete blocks
+    rows_trimmed = numBlocksR * blockSize;
+    cols_trimmed = numBlocksC * blockSize;
+    
+    img1 = img1(1:rows_trimmed, 1:cols_trimmed);
+    img2 = img2(1:rows_trimmed, 1:cols_trimmed);
+    
+    Q_map = zeros(numBlocksR, numBlocksC);
+    
+    for i = 1:numBlocksR
+        for j = 1:numBlocksC
+            % Extract blocks
+            rowIdx = (i-1)*blockSize + 1 : i*blockSize;
+            colIdx = (j-1)*blockSize + 1 : j*blockSize;
+            
+            block1 = img1(rowIdx, colIdx);
+            block2 = img2(rowIdx, colIdx);
+            
+            Q_map(i, j) = calculateBlockUIQI(block1(:), block2(:));
+        end
+    end
+    
+    % Overall UIQI is the mean of local UIQI values
+    Q = mean(Q_map(:));
+    
+end
+
+%% Calculate UIQI for a single block
+function Q = calculateBlockUIQI(x, y)
+% Calculate UIQI for two vectors
+
+    N = length(x);
+    
+    % Mean values
+    mu_x = mean(x);
+    mu_y = mean(y);
+    
+    % Variance and covariance (using N, not N-1, as per original formulation)
+    sigma_x2 = sum((x - mu_x).^2) / N;
+    sigma_y2 = sum((y - mu_y).^2) / N;
+    sigma_xy = sum((x - mu_x) .* (y - mu_y)) / N;
+    
+    % UIQI formula
+    % Q = (4 * sigma_xy * mu_x * mu_y) / ((sigma_x2 + sigma_y2) * (mu_x^2 + mu_y^2))
+    
+    numerator = 4 * sigma_xy * mu_x * mu_y;
+    denominator = (sigma_x2 + sigma_y2) * (mu_x^2 + mu_y^2);
+    
+    % Handle edge cases
+    if denominator < eps
+        % Both images are constant or near-constant
+        if abs(mu_x - mu_y) < eps
+            Q = 1;  % Identical constant images
+        else
+            Q = 0;  % Different constant images
+        end
+    else
+        Q = numerator / denominator;
+    end
+    
+    % Ensure Q is in valid range [-1, 1]
+    Q = max(-1, min(1, Q));
+    
 end
